@@ -2,13 +2,25 @@
 
 Has been tested in pytorch=0.4.0, python=3.6, CUDA=9.0
 
+
+
+
 ### Install
+
+## Linux
 
 ```bash
 export CUDA_HOME=/usr/local/cuda #use your CUDA instead
 chmod a+x install.sh
 ./install.sh
 ```
+
+## Windows
+
+```bash
+install.bat
+```
+
 
 ### Test
 
