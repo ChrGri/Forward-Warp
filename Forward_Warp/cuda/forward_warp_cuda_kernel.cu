@@ -7,6 +7,9 @@
 #include <vector>
 
 #include "forward_warp.h"
+
+//#include <torch/extension.h>
+
 using at::native::detail::GridSamplerInterpolation;
 
 static __forceinline__ __device__ 
@@ -27,51 +30,47 @@ __global__ void forward_warp_cuda_forward_kernel(
     const scalar_t* im0,
     const scalar_t* flow,
     scalar_t* im1,
-    const int B,
-    const int C,
-    const int H,
-    const int W,
-    const GridSamplerInterpolation interpolation_mode) {
-  // CUDA_KERNEL_LOOP(index, total_step-1) {
-  // bug fix, thx to @tkkcc
-  CUDA_KERNEL_LOOP(index, total_step) {
-    const int b = index / (H * W);
-    const int h = (index-b*H*W) / W;
-    const int w = index % W;
-    const scalar_t x = (scalar_t)w + flow[index*2+0];
-    const scalar_t y = (scalar_t)h + flow[index*2+1];
-    if (interpolation_mode == GridSamplerInterpolation::Bilinear) {
-      const int x_f = static_cast<int>(::floor(x));
-      const int y_f = static_cast<int>(::floor(y));
-      const int x_c = x_f + 1;
-      const int y_c = y_f + 1;
-      if(x_f>=0 && x_c<W && y_f>=0 && y_c<H){
-        const scalar_t nw_k = (x_c - x) * (y_c - y);
-        const scalar_t ne_k = (x - x_f) * (y_c - y);
-        const scalar_t sw_k = (x_c - x) * (y - y_f);
-        const scalar_t se_k = (x - x_f) * (y - y_f);
-        const scalar_t* im0_p = im0+get_im_index(b, 0, h, w, C, H, W);
-        scalar_t* im1_p = im1+get_im_index(b, 0, y_f, x_f, C, H, W);
-        for (int c = 0; c < C; ++c, im0_p+=H*W, im1_p+=H*W){
-            atomicAdd(im1_p,     nw_k*(*im0_p));
-            atomicAdd(im1_p+1,   ne_k*(*im0_p));
-            atomicAdd(im1_p+W,   sw_k*(*im0_p));
-            atomicAdd(im1_p+W+1, se_k*(*im0_p));
-        }
-      }
-    } 
-    else if (interpolation_mode == GridSamplerInterpolation::Nearest) {
-      const int x_nearest = static_cast<int>(::round(x));
-      const int y_nearest = static_cast<int>(::round(y));
-      if(x_nearest>=0 && x_nearest<W && y_nearest>=0 && y_nearest<H){
-        const scalar_t* im0_p = im0+get_im_index(b, 0, h, w, C, H, W);
-        scalar_t* im1_p = im1+get_im_index(b, 0, y_nearest, x_nearest, C, H, W);
-        for (int c = 0; c < C; ++c, im0_p += H*W, im1_p += H*W) {
-            *im1_p = *im0_p;
-        }
-      }
-    }
-  }
+    const int B_s,
+    const int C_s,
+    const int H_s,
+    const int W_s,
+	const int B_t,
+    const int C_t,
+    const int H_t,
+    const int W_t
+	) 
+	{
+	// CUDA_KERNEL_LOOP(index, total_step-1) {
+	// bug fix, thx to @tkkcc
+	CUDA_KERNEL_LOOP(index, total_step) 
+	{
+		const int b_s = index / (H_s * W_s);
+		const int h_s = (index-b_s*H_s*W_s) / W_s;
+		const int w_s = index % W_s;
+		const scalar_t x = flow[index*2+0];
+		const scalar_t y = flow[index*2+1];
+		 
+		// get pixel position in target image
+		const int x_nearest = static_cast<int>(::round(x));
+		const int y_nearest = static_cast<int>(::round(y));
+		
+		// check whether pixel index is within target image dimension
+		if(x_nearest>=0 && x_nearest<W_t && y_nearest>=0 && y_nearest<H_t)
+		{
+			// pointer to source image pixel
+			const scalar_t* im0_p = im0 + get_im_index(b_s, 0, h_s, w_s, C_s, H_s, W_s);
+			
+			// pointer to target image pixel
+			scalar_t* im1_p = im1 + get_im_index(b_s, 0, y_nearest, x_nearest, C_t, H_t, W_t);
+			
+			for (int c = 0; c < C_s; ++c, im0_p += H_s*W_s, im1_p += H_t*W_t) 
+			{
+				//  add pixel value from source image to target image
+				atomicAdd(im1_p, *im0_p);
+			}
+		}
+    
+	}
 }
 
 template <typename scalar_t>
@@ -82,105 +81,119 @@ __global__ void forward_warp_cuda_backward_kernel(
     const scalar_t* flow,
     scalar_t* im0_grad,
     scalar_t* flow_grad,
-    const int B,
-    const int C,
-    const int H,
-    const int W,
-    const GridSamplerInterpolation interpolation_mode) {
-  CUDA_KERNEL_LOOP(index, total_step) {
-    const int b = index / (H * W);
-    const int h = (index-b*H*W) / W;
-    const int w = index % W;
-    const scalar_t x = (scalar_t)w + flow[index*2+0];
-    const scalar_t y = (scalar_t)h + flow[index*2+1];
-    if (interpolation_mode == GridSamplerInterpolation::Bilinear) {
-      const int x_f = static_cast<int>(::floor(x));
-      const int y_f = static_cast<int>(::floor(y));
-      const int x_c = x_f + 1;
-      const int y_c = y_f + 1;
-      if(x_f>=0 && x_c<W && y_f>=0 && y_c<H){
-        const scalar_t nw_k = (x_c - x) * (y_c - y);
-        const scalar_t sw_k = (x_c - x) * (y - y_f);
-        const scalar_t ne_k = (x - x_f) * (y_c - y);
-        const scalar_t se_k = (x - x_f) * (y - y_f);
-        scalar_t flow_grad_x = 0;
-        scalar_t flow_grad_y = 0;
-        scalar_t* im0_grad_p = im0_grad+get_im_index(b, 0, h, w, C, H, W);
-        for (int c = 0; c < C; ++c, im0_grad_p+=H*W){
-          const scalar_t nw_grad = grad_output[get_im_index(b, c, y_f, x_f, C, H, W)];
-          const scalar_t ne_grad = grad_output[get_im_index(b, c, y_f, x_c, C, H, W)];
-          const scalar_t sw_grad = grad_output[get_im_index(b, c, y_c, x_f, C, H, W)];
-          const scalar_t se_grad = grad_output[get_im_index(b, c, y_c, x_c, C, H, W)];
-          const scalar_t p = im0[get_im_index(b, c, h, w, C, H, W)];
-          atomicAdd(im0_grad_p, nw_k*nw_grad);
-          atomicAdd(im0_grad_p, ne_k*ne_grad);
-          atomicAdd(im0_grad_p, sw_k*sw_grad);
-          atomicAdd(im0_grad_p, se_k*se_grad);
-          flow_grad_x -= (y_c-y)*p*nw_grad;
-          flow_grad_y -= (x_c-x)*p*nw_grad;
-          flow_grad_x += (y_c-y)*p*ne_grad;
-          flow_grad_y -= (x-x_f)*p*ne_grad;
-          flow_grad_x -= (y-y_f)*p*sw_grad;
-          flow_grad_y += (x_c-x)*p*sw_grad;
-          flow_grad_x += (y-y_f)*p*se_grad;
-          flow_grad_y += (x-x_f)*p*se_grad;
-        }
-        flow_grad[index*2+0] = flow_grad_x;
-        flow_grad[index*2+1] = flow_grad_y;
-      }
-    } 
-    else if (interpolation_mode == GridSamplerInterpolation::Nearest) {
-      const int x_nearest = static_cast<int>(::round(x));
-      const int y_nearest = static_cast<int>(::round(y));
-      if(x_nearest>=0 && x_nearest<W && y_nearest>=0 && y_nearest<H){
-        scalar_t* im0_grad_p = im0_grad+get_im_index(b, 0, h, w, C, H, W);
-        const scalar_t* im1_grad_p = grad_output+get_im_index(b, 0, y_nearest, x_nearest, C, H, W);
-        for (int c = 0; c < C; ++c, im0_grad_p += H*W, im1_grad_p += H*W) {
-            *im0_grad_p = *im1_grad_p;
-        }
-      }
-    }
+    const int B_s,
+    const int C_s,
+    const int H_s,
+    const int W_s,
+	const int B_t,
+    const int C_t,
+    const int H_t,
+    const int W_t
+    ) 
+	{
+	CUDA_KERNEL_LOOP(index, total_step) {
+    const int b_s = index / (H_s * W_s);
+    const int h_s = (index-b_s*H_s*W_s) / W_s;
+    const int w_s = index % W_s;
+	
+	// get pixel position in target image
+    const scalar_t x = flow[index*2+0];
+    const scalar_t y = flow[index*2+1];
+	const int x_nearest = static_cast<int>(::round(x));
+	const int y_nearest = static_cast<int>(::round(y));
+	
+	// check if forward-warp point to valid pixel in target image
+	if(x_nearest>=0 && x_nearest<W_t && y_nearest>=0 && y_nearest<H_t)
+	{
+		// backpropagate gradient from previous layer through warping operation
+		// get pointer of source image pixel
+		scalar_t* im0_grad_p = im0_grad + get_im_index(b_s, 0, h_s, w_s, C_s, H_s, W_s);
+		
+		// get pointer of target image pixel
+		const scalar_t* im1_grad_p = grad_output + get_im_index(b_s, 0, y_nearest, x_nearest, C_t, H_t, W_t);
+		
+		for (int c = 0; c < C_s; ++c, im0_grad_p += H_s*W_s, im1_grad_p += H_s*W_s) 
+		{
+			*im0_grad_p = *im1_grad_p;
+			flow_grad[index*2+0] = 1;
+			flow_grad[index*2+1] = 1;
+		}
+	}
   }
 }
 
 at::Tensor forward_warp_cuda_forward(
-    const at::Tensor im0, 
-    const at::Tensor flow,
-    const GridSamplerInterpolation interpolation_mode) {
-  auto im1 = at::zeros_like(im0);
-  const int B = im0.size(0);
-  const int C = im0.size(1);
-  const int H = im0.size(2);
-  const int W = im0.size(3);
-  const int total_step = B * H * W;
-  AT_DISPATCH_FLOATING_TYPES(im0.scalar_type(), "forward_warp_forward_cuda", ([&] {
-    forward_warp_cuda_forward_kernel<scalar_t>
-    <<<GET_BLOCKS(total_step), CUDA_NUM_THREADS>>>(
-      total_step,
-      im0.data<scalar_t>(),
-      flow.data<scalar_t>(),
-      im1.data<scalar_t>(),
-      B, C, H, W,
-      interpolation_mode);
-  }));
+    const at::Tensor im0
+    , const at::Tensor flow
+	, const at::Tensor im1
+	) 
+{
+	
 
-  return im1;
+	const int B_s = im0.size(0);
+	const int C_s = im0.size(1);
+	const int H_s = im0.size(2);
+	const int W_s = im0.size(3);
+
+	const int B_t = im1.size(0);
+	const int C_t = im1.size(1);
+	const int H_t = im1.size(2);
+	const int W_t = im1.size(3);
+	
+	auto im1_out = at::zeros_like(im1);
+	
+	//auto im1 = at::zeros( (B_s, C_s, H_t, W_t) );
+	//auto im1 = torch::zeros( (B_s, C_s, H_t, W_t) );
+	//auto im1 = torch::ones({B_s, C_s, H_t, W_t}, torch::dtype(torch::kFloat64).requires_grad(true));
+	
+
+
+	const int total_step = B_s * H_s * W_s;
+
+
+	AT_DISPATCH_FLOATING_TYPES(im0.scalar_type(), "forward_warp_forward_cuda", ([&] 
+	{
+	forward_warp_cuda_forward_kernel<scalar_t>
+	<<<GET_BLOCKS(total_step), CUDA_NUM_THREADS>>>(
+		  total_step,
+		  im0.data<scalar_t>(),
+		  flow.data<scalar_t>(),
+		  im1_out.data<scalar_t>(),
+		  B_s, C_s, H_s, W_s,
+		  B_t, C_t, H_t, W_t);
+	}));
+	
+
+	return im1_out;
 }
 
 std::vector<at::Tensor> forward_warp_cuda_backward(
-    const at::Tensor grad_output,
-    const at::Tensor im0, 
-    const at::Tensor flow,
-    const GridSamplerInterpolation interpolation_mode) {
-  auto im0_grad = at::zeros_like(grad_output);
-  auto flow_grad = at::empty_like(flow);
-  const int B = im0.size(0);
-  const int C = im0.size(1);
-  const int H = im0.size(2);
-  const int W = im0.size(3);
-  const int total_step = B * H * W;
+    const at::Tensor grad_output
+    , const at::Tensor im0
+    , const at::Tensor flow
+	) 
+{
+	auto im0_grad = at::zeros_like(im0);
+	auto flow_grad = at::zeros_like(flow);
+	
+	const int B_s = im0.size(0);
+	const int C_s = im0.size(1);
+	const int H_s = im0.size(2);
+	const int W_s = im0.size(3);
+	
+	const int B_t = grad_output.size(0);
+	const int C_t = grad_output.size(1);
+	const int H_t = grad_output.size(2);
+	const int W_t = grad_output.size(3);
+	
+	
+	const int total_step = B_s * H_s * W_s;
+	
+	
+	
 
-  AT_DISPATCH_FLOATING_TYPES(grad_output.type(), "forward_warp_backward_cuda", ([&] {
+	AT_DISPATCH_FLOATING_TYPES(grad_output.type(), "forward_warp_backward_cuda", ([&] 
+	{
     forward_warp_cuda_backward_kernel<scalar_t>
     <<<GET_BLOCKS(total_step), CUDA_NUM_THREADS>>>(
       total_step,
@@ -189,9 +202,9 @@ std::vector<at::Tensor> forward_warp_cuda_backward(
       flow.data<scalar_t>(),
       im0_grad.data<scalar_t>(),
       flow_grad.data<scalar_t>(),
-      B, C, H, W,
-      interpolation_mode);
-  }));
+      B_s, C_s, H_s, W_s,
+	  B_t, C_t, H_t, W_t);
+	}));
 
-  return {im0_grad, flow_grad};
+	return {im0_grad, flow_grad};
 }
